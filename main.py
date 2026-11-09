@@ -32,19 +32,30 @@ class RenderRequest(BaseModel):
     apply_anti_copyright: bool = True
 
 def download_from_drive(file_id: str, dest_path: str):
-    """تحميل مباشر للملفات من Google Drive"""
-    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    """تحميل مباشر للملفات من Google Drive مع تخطي صفحات التحذير الحديثة"""
     session = requests.Session()
-    response = session.get(url, stream=True, headers=HEADERS)
     
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
-            response = session.get(url, stream=True, headers=HEADERS)
-            break
+    # استخدام الرابط المباشر الجديد لتخطي صفحة فحص الفيروسات
+    url = "https://drive.usercontent.google.com/download"
+    params = {"id": file_id, "export": "download", "confirm": "t"}
+    
+    response = session.get(url, params=params, stream=True, headers=HEADERS)
+    
+    # في حال رجوع صفحة HTML، نبحث عن رابط أو رمز التأكيد أو نستخدم الرابط البديل
+    content_type = response.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        alt_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+        response = session.get(alt_url, stream=True, headers=HEADERS)
+        content_type = response.headers.get("Content-Type", "")
+        
+        if "text/html" in content_type:
+            raise Exception(
+                f"Google Drive returned an HTML page instead of a media file for ID {file_id}. "
+                f"Make sure the file sharing is set to 'Anyone with the link'."
+            )
 
     if response.status_code != 200:
-        raise Exception(f"Failed to download Drive file ID: {file_id}")
+        raise Exception(f"Failed to download Drive file ID: {file_id} (Status: {response.status_code})")
 
     with open(dest_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=32768):
