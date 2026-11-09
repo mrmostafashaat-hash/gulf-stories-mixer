@@ -46,9 +46,11 @@ def download_from_drive(file_id: str, dest_path: str):
         response = session.get(alt_url, stream=True, headers=HEADERS, timeout=60)
         content_type = response.headers.get("Content-Type", "")
         if "text/html" in content_type:
+            session.close()
             raise Exception(f"Google Drive returned HTML for ID {file_id}. Check 'Anyone with the link' permission.")
 
     if response.status_code != 200:
+        session.close()
         raise Exception(f"Failed to download Drive file ID: {file_id} (Status: {response.status_code})")
 
     with open(dest_path, "wb") as f:
@@ -58,7 +60,7 @@ def download_from_drive(file_id: str, dest_path: str):
     session.close()
 
 def fetch_sfx_automatically(sfx_name: str) -> Optional[str]:
-    """البحث التلقائي عن المؤثر الصوتي وتنزيله"""
+    """البحث التلقائي عن المؤثر الصوتي وتنزيله مع فلترة المدة"""
     clean_name = re.sub(r'[^a-zA-Z0-9_]', '', sfx_name.lower())
     cached_path = os.path.join(SFX_CACHE_DIR, f"{clean_name}.mp3")
     
@@ -68,7 +70,7 @@ def fetch_sfx_automatically(sfx_name: str) -> Optional[str]:
     words = sfx_name.replace("_", " ").replace("-", " ").split()
     search_query = " ".join(words[:2])
 
-    # 1. Freesound
+    # 1. البحث في Freesound
     try:
         fs_url = f"https://freesound.org/search/?q={urllib.parse.quote(search_query)}&f=duration%3A%5B0+TO+5%5D"
         resp = requests.get(fs_url, headers=HEADERS, timeout=8)
@@ -85,7 +87,7 @@ def fetch_sfx_automatically(sfx_name: str) -> Optional[str]:
     except Exception as e:
         print(f"Freesound warning for {sfx_name}: {e}")
 
-    # 2. MyInstants
+    # 2. البحث الاحتياطي في MyInstants
     try:
         mi_url = f"https://www.myinstants.com/en/search/?name={urllib.parse.quote(search_query)}"
         resp = requests.get(mi_url, headers=HEADERS, timeout=8)
@@ -104,7 +106,7 @@ def fetch_sfx_automatically(sfx_name: str) -> Optional[str]:
     return None
 
 def build_single_video_filter(apply_anti_copyright: bool) -> str:
-    """فلتر خفيف على الرامات (720x1280 بدلاً من 1080x1920 لتفادي انهيار رامات Render المجانية)"""
+    """تجهيز فلتر كسر الكوبي رايت وتوحيد المقاس بأقل استهلاك للرامات"""
     target_res = "720:1280"
     if not apply_anti_copyright:
         return f"scale={target_res}:force_original_aspect_ratio=increase,crop={target_res},setsar=1,fps=30,format=yuv420p"
@@ -131,14 +133,23 @@ def cleanup_files(folder_path: str):
         shutil.rmtree(folder_path, ignore_errors=True)
     gc.collect()
 
-def mix_audio_low_ram(voice_path: str, mixed_audio_path: str, sfx_timestamps: Dict[str, Optional[float]], volume_reduction: int):
-    """دمج الصوت في دالة منفصلة لتفريغ الرامات بالكامل فور انتهاء الدمج"""
+def mix_audio_low_ram(voice_path: str, mixed_audio_path: str, sfx_timestamps: Dict[str, Optional[float]], volume_reduction: int) -> float:
+    """دمج الصوت وإرجاع المدة الدقيقة للفويس أوفر بالثواني مع تفريغ الرامات"""
     main_audio = AudioSegment.from_file(voice_path)
     main_audio = effects.normalize(main_audio)
+    
+    # حفظ المدة الأصلية للفويس أوفر بالملي ثانية قبل إضافة أي مؤثرات
+    original_duration_ms = len(main_audio)
+    exact_duration_sec = round(original_duration_ms / 1000.0, 2)
 
     for sfx_name, timestamp in sfx_timestamps.items():
         if timestamp is None:
             continue
+        position_ms = int(float(timestamp) * 1000)
+        # تجاهل أي مؤثر صوتي توقيته بعد انتهاء الفويس أوفر
+        if position_ms >= original_duration_ms:
+            continue
+            
         sfx_file = fetch_sfx_automatically(sfx_name)
         if sfx_file and os.path.exists(sfx_file):
             try:
@@ -147,17 +158,21 @@ def mix_audio_low_ram(voice_path: str, mixed_audio_path: str, sfx_timestamps: Di
                 if len(sfx_audio) > 3000:
                     sfx_audio = sfx_audio[:3000]
                 sfx_audio = sfx_audio.fade_in(100).fade_out(400) - volume_reduction
-                position_ms = int(float(timestamp) * 1000)
                 main_audio = main_audio.overlay(sfx_audio, position=position_ms)
                 del sfx_audio
             except Exception as sfx_err:
                 print(f"Skipping SFX {sfx_name}: {sfx_err}")
 
+    # قص أي زيادة محتملة عن مدة الفويس أوفر الأصلية
+    main_audio = main_audio[:original_duration_ms]
     main_audio.export(mixed_audio_path, format="mp3", bitrate="128k")
+    
     del main_audio
     if os.path.exists(voice_path):
         os.remove(voice_path)
     gc.collect()
+    
+    return exact_duration_sec
 
 @app.get("/")
 def health_check():
@@ -185,9 +200,9 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
     output_video_path = os.path.join(job_dir, f"{req.story_id}_final.mp4")
 
     try:
-        # 1. تحميل ودمج الصوت ثم تفريغ الرامات فوراً
+        # 1. تحميل ودمج الصوت والحصول على المدة الدقيقة بالثواني
         download_from_drive(req.audio_drive_id, voice_path)
-        mix_audio_low_ram(voice_path, mixed_audio_path, req.sfx_timestamps, req.sfx_volume_reduction)
+        audio_duration = mix_audio_low_ram(voice_path, mixed_audio_path, req.sfx_timestamps, req.sfx_volume_reduction)
 
         # 2. تحميل ومعالجة كل فيديو بأقل استهلاك للرامات (-threads 1)
         processed_videos = []
@@ -208,6 +223,7 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "24",
+                "-g", "30",          # نقطة قطع (Keyframe) كل ثانية لضمان دقة القص مع copy
                 "-maxrate", "2M",
                 "-bufsize", "2M",
                 proc_vid_path
@@ -217,7 +233,7 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
             os.remove(raw_vid_path)
             gc.collect()
 
-        # 3. دمج الفيديوهات
+        # 3. دمج الفيديوهات بدون إعادة ترميز
         with open(concat_list_path, "w") as f:
             for p_vid in processed_videos:
                 f.write(f"file '{p_vid}'\n")
@@ -237,7 +253,7 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
             if os.path.exists(p_vid):
                 os.remove(p_vid)
 
-        # 4. تركيب الصوت النهائي وتكرار الخلفية
+        # 4. تركيب الصوت النهائي وتحديد مدة الفيديو الصارمة بـ (-t)
         audio_filter = "highpass=f=70,acompressor=threshold=-16dB:ratio=2:attack=10:release=100"
         final_cmd = [
             "ffmpeg", "-y",
@@ -253,6 +269,7 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
+            "-t", str(audio_duration),  # إجبار الفيديو على التوقف في ثانية انتهاء الفويس أوفر بالضبط
             "-shortest",
             output_video_path
         ]
