@@ -215,7 +215,8 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
             
             prep_cmd = [
                 "ffmpeg", "-y",
-                "-threads", "1",
+                "-threads", "2",     # رفعها إلى 2 يسرع المعالجة مع بقاء الرامات آمنة
+                "-t", "25",          # معالجة أول 25 ثانية فقط من كل فيديو خام لتوفير نصف الوقت
                 "-i", raw_vid_path,
                 "-an",
                 "-map_metadata", "-1",
@@ -223,7 +224,7 @@ def render_story(req: RenderRequest, background_tasks: BackgroundTasks):
                 "-c:v", "libx264",
                 "-preset", "ultrafast",
                 "-crf", "24",
-                "-g", "30",          # نقطة قطع (Keyframe) كل ثانية لضمان دقة القص مع copy
+                "-g", "30",
                 "-maxrate", "2M",
                 "-bufsize", "2M",
                 proc_vid_path
